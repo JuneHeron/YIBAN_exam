@@ -93,8 +93,6 @@
     return fetch(url).then((r) => r.json());
   }
 
-  const askServer = (text) => call('/ask', { text, min: ASK_MIN });
-
   /**
    * 一次把整份卷子问完。
    *
@@ -102,6 +100,10 @@
    * 浏览器有机会重绘**——100 道题就是 100 次重绘机会，于是你能看见翻页。
    * 采集入库之所以快，正是因为它全程不发请求。合并成一次请求后，答题这边
    * 也就没有中间等待了（实测 3 次单条 69ms → 1 次批量 10ms）。
+   *
+   * 服务端的 `/ask`（单条）接口保留着——命令行查库走的是同一套匹配逻辑，别处也可能有人
+   * 直接 curl 它调试——但脚本自己不再调它了：原来「慢速模式」逐题问的就是它，
+   * 那条路径去掉后就成了死代码，所以把客户端那个一行封装也删了。
    */
   async function askServerBatch(texts) {
     const r = await call('/ask-batch', { items: texts, min: ASK_MIN });
@@ -215,19 +217,6 @@
     }
     optionEl.click();
     return 'text';
-  }
-
-  /**
-   * 把选项设成「选中 / 未选中」——**只在当前状态和目标不一致时才点**。
-   *
-   * 抄自参考脚本的多选处理：它不只点该选的，还会点掉不该选的。
-   * 这样重复运行也安全（已答过的不会被翻反），并且能把「随机选择」留下的痕迹清干净。
-   */
-  async function setOption(optionEl, want) {
-    if (isChosen(optionEl) === want) return false;   // 已经是要的状态，别动它
-    clickOption(optionEl);
-    if (!fastMode) await sleep(90);                  // 让 React 状态更新跟上
-    return true;
   }
 
   /** 从 n 个里随机取 k 个下标（多选猜答案用） */
@@ -382,13 +371,17 @@
 
   let running = false;
   let lastStop = '';   // 上一轮遍历为什么停下，收尾时一起报出来
-  // 快速模式：去掉所有等待。参考脚本「一秒答完」的全部秘密就是这个——
-  // 它主循环里没有任何 await/setTimeout，浏览器来不及重绘，所以看不见翻页过程。
+  // 这里只有一条路径：**全程不等待**。参考脚本「一秒答完」的全部秘密就是这个——
+  // 主循环里没有任何 await/setTimeout，浏览器来不及重绘，所以看不见翻页过程。
+  //
+  // 曾经面板上有个「快速模式」开关，不勾就走逐题边走边问的老路（慢、过程像人在点）。
+  // 2026-09-24 把它去掉了，只留不等待的那条：两遍批量路径一次请求问完整份卷子
+  // （老路是每题一次），而且答案按题干对应、不依赖两遍遍历的下标对齐。
+  // 老路唯一的好处是「过程看得见」，不值得为它多维护一份遍历逻辑。
   //
   // 更正一处错误推理：我原先写「快会被风控弹验证码」是错的。实测（用户确认）
   // 人机验证是**答题前的准入门槛**，跟答题速度无关。所以快慢不改变会不会遇到验证码。
   // 至于速度是否会影响其它风控判断，我没有证据，就不下结论。
-  let fastMode = false;
 
   /**
    * 依次走过试卷的每一页，对每道识别到的题调用 onQuestion(q)。
@@ -431,17 +424,13 @@
         return q2.length > 0 && q2[0].stem !== stemBefore;
       };
       next.click();
-      if (fastMode) {
-        // 快速模式：只做一次同步检查；没过就**每 20ms** 探一次。
-        // 原来是 100ms 一探——只要 React 的更新晚一帧，就白等整整 100ms，
-        // 100 道题累积成十几秒（实测每题 125~148ms，就是这个数）。
-        if (!turned() && !await waitUntil(turned, 2000, 20)) {
-          lastStop = '翻页没反应';
-          break;
-        }
-      } else {
-        if (!await waitUntil(turned, 5000, 100)) { lastStop = '翻页没反应'; break; }
-        await sleep(120);
+      // 只做一次同步检查；没过就**每 20ms** 探一次。
+      // 原来是 100ms 一探——只要 React 的更新晚一帧，就白等整整 100ms，
+      // 100 道题累积成十几秒（实测每题 125~148ms，就是这个数）。
+      // 2s 还没翻过去就放弃：正常情况下一帧就够，这么久没动基本是真出问题了。
+      if (!turned() && !await waitUntil(turned, 2000, 20)) {
+        lastStop = '翻页没反应';
+        break;
       }
     }
     return count;
@@ -462,23 +451,30 @@
       const back = findButton('上一题');
       if (!back || back.disabled) break;
       back.click();
-      if (!fastMode) await sleep(60);
     }
-    if (!fastMode) await sleep(200);
     log(`已退回第一题（原来在第 ${prog[0]} 题）`);
   }
 
   /**
-   * 自动答题：答完当前题后**自动点「下一题」**，一路答到底。
+   * 自动答题：答完当前题后**自动点「下一题」**，一路答到底。**不自动交卷**。
    *
-   * 这页一次只显示一道题（底下是 上一题 / 3 / 100 / 下一题），
-   * 所以早先「把本页识别到的题全答一遍」只能答一道——页面上本来就只有一道。
-   *
-   * 停止条件有三个（任一满足就停）：下一题按钮消失或禁用、进度已到最后、翻页后题干没变。
-   * **不自动交卷**——交卷留给人来点。
+   * 入口只负责两件事：防重复点击、出错时提示。算法在 autoAnswerTwoPass。
    */
+  async function autoAnswer() {
+    if (running) { toast('正在跑，别重复点'); return; }
+    running = true;
+    try {
+      await autoAnswerTwoPass();
+    } catch (e) {
+      toast('出错了：' + e.message);
+    } finally {
+      running = false;
+    }
+  }
+
   /**
-   * 快速模式的答题：**两遍走**。
+   * 答题算法：**两遍走**。这是唯一的一条路径——原来还有个「慢速模式」开关
+   * （逐题边走边问），2026-09-24 去掉了。
    *
    *   第一遍 只读不点：逐页收集「题干 + 选项」，期间不发任何请求
    *   一次批量问本地库，拿到全部答案
@@ -487,8 +483,18 @@
    *
    * 两遍内部都不做等待，等待只在「翻页后题干没变」的兜底检查里出现，
    * 所以浏览器来不及在题目之间重绘——和参考脚本一个原理。
+   *
+   * 为什么非两遍不可：每道题各问一次的话，每次 `await` 都会把控制权交还浏览器、
+   * 让它有机会重绘，于是整轮答题看得见翻页（100 题 = 100 次重绘机会）。
+   * 一次批量问完，第二遍循环里就没有任何网络等待了。采集入库之所以一直很快，
+   * 正是因为它全程不发请求——同一个道理。
+   *
+   * 这页一次只显示一道题（底下是 上一题 / 3 / 100 / 下一题），
+   * 所以早先「把本页识别到的题全答一遍」只能答一道——页面上本来就只有一道。
+   *
+   * 停止条件（任一满足就停）：下一题按钮消失或禁用、进度已到最后、翻页后题干没变。
    */
-  async function autoAnswerFast() {
+  async function autoAnswerTwoPass() {
     const items = [];
     const stems = [];
     await forEachQuestion(async (q) => { items.push(toServerText(q)); stems.push(q.stem); });
@@ -536,8 +542,10 @@
       } else {
         idxs = [Math.floor(Math.random() * q.options.length)];
       }
-      // 多选题遍历所有选项（该选的选上、不该选的取消）；单选只动目标那一个。
-      // 这里直接读 isChosen 判断、不做等待：选项之间互不影响，不需要等 React 刷新。
+      // 多选题遍历**所有**选项：该选的选上、不该选的取消掉（抄参考脚本的做法）。
+      // 这样重复运行也安全（已答过的不会被翻反），也能把「随机选择」留下的痕迹清干净。
+      // 单选只动目标那一个——radio 语义下点了新的就自动取消旧的。
+      // 这里直接读 isChosen 判断、点完不等待：选项之间互不影响，不需要等 React 刷新。
       const want = new Set(idxs);
       const targets = multiQ ? q.options.map((_, k) => k) : idxs;
       for (const k of targets) {
@@ -548,82 +556,10 @@
       if (letter) hit++;
     });
 
-    toast(`快速模式：答 ${items.length} 题，命中 ${hit}`
+    toast(`答 ${items.length} 题，命中 ${hit}`
       + `，库里没这题 ${noEntry}`
       + (mismatch ? `，库里有但选项对不上 ${mismatch}（明细看控制台）` : '')
       + `，点击 ${clicks} 次（${lastStop}）`);
-  }
-
-  async function autoAnswer() {
-    if (running) { toast('正在跑，别重复点'); return; }
-    running = true;
-    if (fastMode) {
-      // 快速模式走两遍批量路径（快、看不见翻页）；慢速模式走下面逐题问的老路（慢、像人在点）
-      try { await autoAnswerFast(); }
-      catch (e) { toast('出错了：' + e.message); }
-      finally { running = false; }
-      return;
-    }
-    let n = 0, hit = 0, miss = 0, clicks = 0;
-    const t0 = Date.now();
-    try {
-      await forEachQuestion(async (q) => {
-        let letter = null, note = '';
-        try {
-          const res = await askServer(toServerText(q));
-          if (res.found && res.best && res.best.letter) {
-            letter = res.best.letter;
-            note = `${res.best.score}/${res.best.kind}`;
-          } else if (res.found) {
-            note = '库里选项对不上';
-            log('库里有但选项对不上：', q.stem.slice(0, 40),
-                '｜库里答案原文=', (res.candidates && res.candidates[0] && res.candidates[0].texts) || res.best,
-                '｜本页选项=', q.options.map((o) => o.text));
-          } else {
-            note = '题库无此题';
-          }
-        } catch (e) {
-          toast('连不上本地服务，已停下：' + e.message);
-          throw e;                       // 抛出去让遍历终止
-        }
-
-        const multiQ = isMultiQuestion(q.container);
-        let idxs;
-        if (letter) {
-          idxs = [...new Set(letter)].map((c) => c.charCodeAt(0) - 65);  // 服务端给的位置对应「发过去的顺序」
-        } else if (multiQ) {
-          // 多选且库里没有：随机选 2..n 个。只选一个在多选里几乎必错（用户反馈过「只选了一个」）
-          idxs = randomSubset(q.options.length);
-        } else {
-          idxs = [Math.floor(Math.random() * q.options.length)];
-        }
-        // 多选题遍历**所有**选项：该选的选上、不该选的取消掉（抄参考脚本的做法）。
-        // 这样重复运行也安全（已答过的不会被翻反），也能把「随机选择」留下的痕迹清干净。
-        // 单选只动目标那一个——radio 语义下点了新的就自动取消旧的。
-        const want = new Set(idxs);
-        const targets = multiQ ? q.options.map((_, i) => i) : idxs;
-        for (const i of targets) {
-          const target = q.options[i];
-          if (!target) continue;
-          if (await setOption(target.el, want.has(i))) clicks++;   // 状态已对就不点，返回 false
-        }
-
-        if (letter) hit++; else miss++;
-        n++;
-        log(`#${n}${multiQ ? '[多选]' : ''} `
-          + `${letter ? '命中 ' + letter : '随机 ' + idxs.map((i) => String.fromCharCode(65 + i)).join('')}`
-          + ` (${note}) ${q.stem.slice(0, 34)}`);
-      });
-    } catch (e) {
-      // 查询失败时已经提示过，这里只负责收尾
-    } finally {
-      running = false;
-    }
-    const secs = ((Date.now() - t0) / 1000).toFixed(1);
-    // 不报「几个选项没点上」：这页的选中态读不出来（没有 radio、class 也不变），
-    // 校验必然失败，报出来是假警报——上一版就是这么误报出「103 个没点上」的。
-    toast(`本轮：答 ${n} 题，命中 ${hit}，随机 ${miss}，点击 ${clicks} 次`
-      + `（${lastStop}，${secs}s）`);
   }
 
   // ============================================================
@@ -743,11 +679,8 @@
       <button id="yqbank-answer" style="width:100%;margin-bottom:4px;padding:4px">自动答题</button>
       <button id="yqbank-harvest" style="width:100%;margin-bottom:4px;padding:4px">采集入库</button>
       <button id="yqbank-diag" style="width:100%;padding:4px">诊断</button>
-      <label style="display:block;margin-top:6px;font-size:12px;color:#444">
-        <input type="checkbox" id="yqbank-fast"> 快速模式（不等待）
-      </label>
-      <div style="font-size:11px;color:#999;margin-top:2px">
-        快 = 看不见翻页过程（参考脚本就是这么做到的）
+      <div style="font-size:11px;color:#999;margin-top:6px">
+        整份卷子两遍走：先只读收集、再一次性取答案，所以看不见翻页过程；<b>不自动交卷</b>
       </div>
       <button id="yqbank-clear" style="width:100%;margin-top:6px;padding:4px;color:#c00">清空题库</button>
       <div id="yqbank-toast" style="margin-top:6px;font-size:12px;color:#0a0;opacity:0;transition:opacity .3s"></div>
@@ -775,10 +708,6 @@
       } catch (e) {
         toast('清空失败：' + e.message);
       }
-    };
-    box.querySelector('#yqbank-fast').onchange = (ev) => {
-      fastMode = !!ev.target.checked;
-      toast(fastMode ? '快速模式：开（不等待，看不见翻页）' : '快速模式：关（带等待，看得见过程）');
     };
 
     // 探活（走 GM_xmlhttpRequest，避免 HTTPS 页面访问 http://127.0.0.1 被拦）
