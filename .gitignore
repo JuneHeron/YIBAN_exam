@@ -1,0 +1,24 @@
+# 题库数据库：里面是采集下来的真实题目，属于个人学习数据，
+# 而且仓库使用者应该自己攒自己的库，所以不入库。
+bank.db
+bank-*.bak.db
+bank_*.db
+*.bak.db
+
+# 打包产物 / 本地副本
+*.zip
+易班脚本/
+发布/
+
+# 误删事故的恢复文件（历史遗留，可删）
+_恢复备份/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

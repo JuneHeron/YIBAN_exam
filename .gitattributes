@@ -1,0 +1,9 @@
+# 仓库里以 LF 存储；Windows 上检出为 CRLF。
+* text=auto eol=lf
+
+# 批处理必须是 CRLF，cmd 对 LF-only 的 bat 处理不完整（goto/label 会出问题）。
+*.bat text eol=crlf
+
+# 二进制
+*.db binary
+*.zip binary
