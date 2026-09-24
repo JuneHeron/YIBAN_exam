@@ -143,7 +143,6 @@ python bank.py clear --all --yes # 真删（删前自动备份）
 
 ## 文件
 
-> 要改这个项目的话，先看根目录的 `开发须知.md`——那里记了踩过的坑和验证方法。
 
 ```
 yiban-bank.user.js             当前脚本
